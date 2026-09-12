@@ -2,7 +2,6 @@ import os
 import asyncio
 import tempfile
 import json
-import re
 
 import aiohttp
 
@@ -32,7 +31,7 @@ X_USERNAME = "FERNANDEZFrdric"
 # Check X every 30 seconds
 CHECK_INTERVAL = 30
 
-# Remember the latest X post we have seen
+# Remember the last X post seen
 STATE_FILE = "x_state.json"
 
 X_API_BASE = "https://api.x.com/2"
@@ -59,7 +58,10 @@ def load_state():
 
     except Exception as error:
 
-        print("Could not load state:", error)
+        print(
+            "Could not load state:",
+            error
+        )
 
         return {}
 
@@ -82,7 +84,10 @@ def save_state(state):
 
     except Exception as error:
 
-        print("Could not save state:", error)
+        print(
+            "Could not save state:",
+            error
+        )
 
 
 # ============================================================
@@ -158,7 +163,7 @@ async def get_x_user_id():
     user_id = user["id"]
 
     print(
-        f"✅ X user found: @{user['username']}"
+        f"X user found: @{user['username']}"
     )
 
     print(
@@ -169,7 +174,7 @@ async def get_x_user_id():
 
 
 # ============================================================
-# GET NEW X POSTS
+# GET POSTS FROM X
 # ============================================================
 
 async def get_x_posts(
@@ -179,9 +184,15 @@ async def get_x_posts(
 
     params = {
         "max_results": 10,
-        "tweet.fields": "id,text,created_at,attachments",
-        "expansions": "attachments.media_keys",
-        "media.fields": "media_key,type"
+        "tweet.fields": (
+            "id,text,created_at,attachments"
+        ),
+        "expansions": (
+            "attachments.media_keys"
+        ),
+        "media.fields": (
+            "media_key,type"
+        )
     }
 
     if since_id:
@@ -239,29 +250,34 @@ async def get_x_posts(
             if media.get("type") == "video":
 
                 has_video = True
+
                 break
 
         results.append(
             {
                 "id": post["id"],
+
                 "url": (
                     f"https://x.com/"
                     f"{X_USERNAME}/status/"
                     f"{post['id']}"
                 ),
+
                 "text": post.get(
                     "text",
                     ""
                 ),
+
                 "created_at": post.get(
                     "created_at"
                 ),
+
                 "has_video": has_video,
             }
         )
 
-    # X returns newest first.
-    # We process oldest first.
+    # X normally returns newest first.
+    # Process oldest first.
     results.sort(
         key=lambda post: int(post["id"])
     )
@@ -329,11 +345,15 @@ def download_video(
             + ".mp4"
         )
 
-        if os.path.exists(mp4_file):
+        if os.path.exists(
+            mp4_file
+        ):
 
             return mp4_file
 
-        if os.path.exists(filename):
+        if os.path.exists(
+            filename
+        ):
 
             return filename
 
@@ -382,7 +402,7 @@ async def process_x_post(
     )
 
     print(
-        "🎬 VIDEO POST DETECTED"
+        "VIDEO POST DETECTED"
     )
 
     print(
@@ -411,10 +431,11 @@ async def process_x_post(
                 video_path
             )
 
+            # Telegram Bot API standard limit
             if file_size > 50 * 1024 * 1024:
 
                 print(
-                    "❌ Video is larger than 50 MB."
+                    "Video is larger than 50 MB."
                 )
 
                 return False
@@ -425,7 +446,7 @@ async def process_x_post(
             )
 
             print(
-                "📤 Uploading to Telegram..."
+                "Uploading video to Telegram..."
             )
 
             with open(
@@ -441,7 +462,7 @@ async def process_x_post(
                 )
 
             print(
-                f"✅ Successfully posted {post_id}"
+                f"Successfully posted: {post_id}"
             )
 
             return True
@@ -449,7 +470,7 @@ async def process_x_post(
     except Exception as error:
 
         print(
-            "❌ ERROR processing video:"
+            "ERROR processing video:"
         )
 
         print(
@@ -472,7 +493,7 @@ async def monitor_x(
     )
 
     print(
-        "🤖 OFFICIAL X API MONITOR STARTED"
+        "OFFICIAL X API MONITOR STARTED"
     )
 
     print(
@@ -487,7 +508,10 @@ async def monitor_x(
         "======================================"
     )
 
-    # Get the X account's numeric ID
+    # --------------------------------------------------------
+    # GET USER ID
+    # --------------------------------------------------------
+
     try:
 
         user_id = await get_x_user_id()
@@ -495,7 +519,7 @@ async def monitor_x(
     except Exception as error:
 
         print(
-            "❌ Could not initialize X API:"
+            "X API INITIALIZATION ERROR:"
         )
 
         print(
@@ -544,8 +568,7 @@ async def monitor_x(
                 )
 
                 print(
-                    f"✅ Initial position set:"
-                    f" {latest_id}"
+                    f"Initial position set: {latest_id}"
                 )
 
                 print(
@@ -561,15 +584,12 @@ async def monitor_x(
         except Exception as error:
 
             print(
-                "❌ Initial X API check failed:"
+                "INITIAL X API CHECK FAILED:"
             )
 
             print(
                 error
             )
-
-        # Give X API a moment before monitoring
-        await asyncio.sleep(3)
 
         last_seen_id = load_state().get(
             "last_seen_id"
@@ -591,19 +611,20 @@ async def monitor_x(
             if posts:
 
                 print(
-                    f"🆕 Found {len(posts)} new X post(s)."
+                    f"Found {len(posts)} new X post(s)."
                 )
 
                 for post in posts:
 
                     post_id = post["id"]
 
-                    # Move our position forward
+                    # Update position
                     last_seen_id = post_id
 
                     save_state(
                         {
-                            "last_seen_id": last_seen_id
+                            "last_seen_id":
+                            last_seen_id
                         }
                     )
 
@@ -612,7 +633,7 @@ async def monitor_x(
                     )
 
                     print(
-                        "New X post:"
+                        "NEW X POST:"
                     )
 
                     print(
@@ -622,7 +643,7 @@ async def monitor_x(
                     if not post["has_video"]:
 
                         print(
-                            "⏭️ No video. Skipping."
+                            "No video. Skipping."
                         )
 
                         continue
@@ -635,7 +656,7 @@ async def monitor_x(
                     if not success:
 
                         print(
-                            "⚠️ Video could not be uploaded."
+                            "Video could not be uploaded."
                         )
 
             else:
@@ -651,7 +672,7 @@ async def monitor_x(
             )
 
             print(
-                "❌ X MONITOR ERROR"
+                "X MONITOR ERROR:"
             )
 
             print(
@@ -718,7 +739,8 @@ async def save_video(
     ):
 
         await update.message.reply_text(
-            "❌ That doesn't look like an X/Twitter post URL."
+            "❌ That doesn't look like an "
+            "X/Twitter post URL."
         )
 
         return
@@ -821,7 +843,9 @@ async def post_init(
     application
 ):
 
-    application.create_task(
+    # Start the monitor directly as an asyncio task.
+    # This avoids the PTB create_task startup warning.
+    asyncio.create_task(
         monitor_x(
             application
         )
@@ -857,7 +881,7 @@ def main():
     )
 
     print(
-        "🤖 X → Telegram Video Bot is running..."
+        "X → Telegram Video Bot is running..."
     )
 
     app.run_polling()
@@ -868,4 +892,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
