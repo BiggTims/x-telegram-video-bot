@@ -3,7 +3,8 @@ import asyncio
 import tempfile
 import json
 import re
-import time
+
+import aiohttp
 
 from telegram import Update
 from telegram.ext import (
@@ -14,7 +15,6 @@ from telegram.ext import (
 
 import yt_dlp
 import imageio_ffmpeg
-import feedparser
 
 
 # ============================================================
@@ -23,32 +23,29 @@ import feedparser
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
+X_BEARER_TOKEN = os.environ["X_BEARER_TOKEN"]
+
 CHANNEL = "@biggtimsxvid"
 
-# X account we want to monitor
 X_USERNAME = "FERNANDEZFrdric"
 
-# Check for new posts every 60 seconds
-CHECK_INTERVAL = 60
+# Check X every 30 seconds
+CHECK_INTERVAL = 30
 
-# RSS feed used to detect new posts
-RSS_URL = (
-    f"https://rsshub.isrss.com/twitter/user/"
-    f"{X_USERNAME}?routeParams=exclude_rts_replies"
-)
+# Remember the latest X post we have seen
+STATE_FILE = "x_state.json"
 
-# File used to remember processed posts
-STATE_FILE = "processed_posts.json"
+X_API_BASE = "https://api.x.com/2"
 
 
 # ============================================================
-# STATE / DUPLICATE PROTECTION
+# STATE
 # ============================================================
 
-def load_processed_posts():
+def load_state():
 
     if not os.path.exists(STATE_FILE):
-        return set()
+        return {}
 
     try:
 
@@ -58,24 +55,16 @@ def load_processed_posts():
             encoding="utf-8"
         ) as file:
 
-            data = json.load(file)
-
-        return set(data)
+            return json.load(file)
 
     except Exception as error:
 
-        print(
-            "Could not load processed posts:",
-            error
-        )
+        print("Could not load state:", error)
 
-        return set()
+        return {}
 
 
-def save_processed_posts(processed_posts):
-
-    # Keep only the latest 500 IDs
-    posts = list(processed_posts)[-500:]
+def save_state(state):
 
     try:
 
@@ -86,16 +75,198 @@ def save_processed_posts(processed_posts):
         ) as file:
 
             json.dump(
-                posts,
-                file
+                state,
+                file,
+                indent=2
             )
 
     except Exception as error:
 
-        print(
-            "Could not save processed posts:",
-            error
+        print("Could not save state:", error)
+
+
+# ============================================================
+# X API REQUEST
+# ============================================================
+
+async def x_api_get(
+    session,
+    endpoint,
+    params=None
+):
+
+    url = f"{X_API_BASE}{endpoint}"
+
+    headers = {
+        "Authorization": f"Bearer {X_BEARER_TOKEN}"
+    }
+
+    async with session.get(
+        url,
+        headers=headers,
+        params=params,
+        timeout=aiohttp.ClientTimeout(total=30)
+    ) as response:
+
+        text = await response.text()
+
+        if response.status != 200:
+
+            raise Exception(
+                f"X API error {response.status}: {text}"
+            )
+
+        try:
+
+            return json.loads(text)
+
+        except Exception:
+
+            raise Exception(
+                f"Invalid X API response: {text}"
+            )
+
+
+# ============================================================
+# GET X USER ID
+# ============================================================
+
+async def get_x_user_id():
+
+    print(
+        f"Looking up X user: @{X_USERNAME}"
+    )
+
+    async with aiohttp.ClientSession() as session:
+
+        data = await x_api_get(
+            session,
+            f"/users/by/username/{X_USERNAME}",
+            {
+                "user.fields": "id,username"
+            }
         )
+
+    user = data.get("data")
+
+    if not user:
+
+        raise Exception(
+            f"Could not find X user @{X_USERNAME}"
+        )
+
+    user_id = user["id"]
+
+    print(
+        f"✅ X user found: @{user['username']}"
+    )
+
+    print(
+        f"X user ID: {user_id}"
+    )
+
+    return user_id
+
+
+# ============================================================
+# GET NEW X POSTS
+# ============================================================
+
+async def get_x_posts(
+    user_id,
+    since_id=None
+):
+
+    params = {
+        "max_results": 10,
+        "tweet.fields": "id,text,created_at,attachments",
+        "expansions": "attachments.media_keys",
+        "media.fields": "media_key,type"
+    }
+
+    if since_id:
+
+        params["since_id"] = since_id
+
+    async with aiohttp.ClientSession() as session:
+
+        data = await x_api_get(
+            session,
+            f"/users/{user_id}/tweets",
+            params
+        )
+
+    posts = data.get(
+        "data",
+        []
+    )
+
+    includes = data.get(
+        "includes",
+        {}
+    )
+
+    media_items = includes.get(
+        "media",
+        []
+    )
+
+    media_by_key = {
+        media["media_key"]: media
+        for media in media_items
+    }
+
+    results = []
+
+    for post in posts:
+
+        media_keys = (
+            post.get("attachments", {})
+            .get("media_keys", [])
+        )
+
+        has_video = False
+
+        for media_key in media_keys:
+
+            media = media_by_key.get(
+                media_key
+            )
+
+            if not media:
+                continue
+
+            if media.get("type") == "video":
+
+                has_video = True
+                break
+
+        results.append(
+            {
+                "id": post["id"],
+                "url": (
+                    f"https://x.com/"
+                    f"{X_USERNAME}/status/"
+                    f"{post['id']}"
+                ),
+                "text": post.get(
+                    "text",
+                    ""
+                ),
+                "created_at": post.get(
+                    "created_at"
+                ),
+                "has_video": has_video,
+            }
+        )
+
+    # X returns newest first.
+    # We process oldest first.
+    results.sort(
+        key=lambda post: int(post["id"])
+    )
+
+    return results
 
 
 # ============================================================
@@ -112,7 +283,9 @@ def download_video(
         "%(id)s.%(ext)s"
     )
 
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg_path = (
+        imageio_ffmpeg.get_ffmpeg_exe()
+    )
 
     options = {
 
@@ -151,21 +324,22 @@ def download_video(
             info
         )
 
-        # Expected merged MP4
         mp4_file = (
             os.path.splitext(filename)[0]
             + ".mp4"
         )
 
         if os.path.exists(mp4_file):
+
             return mp4_file
 
-        # Fallback
         if os.path.exists(filename):
+
             return filename
 
-        # Search temporary directory
-        for file in os.listdir(output_dir):
+        for file in os.listdir(
+            output_dir
+        ):
 
             path = os.path.join(
                 output_dir,
@@ -191,112 +365,7 @@ def download_video(
 
 
 # ============================================================
-# EXTRACT X POST ID
-# ============================================================
-
-def extract_post_id(url):
-
-    if not url:
-        return None
-
-    match = re.search(
-        r"/status/(\d+)",
-        url
-    )
-
-    if match:
-        return match.group(1)
-
-    return None
-
-
-# ============================================================
-# GET POSTS FROM RSS FEED
-# ============================================================
-
-def get_x_posts():
-
-    print(
-        "Checking X:",
-        X_USERNAME
-    )
-
-    feed = feedparser.parse(
-        RSS_URL
-    )
-
-    if feed.bozo and not feed.entries:
-
-        raise Exception(
-            "RSS feed could not be read."
-        )
-
-    posts = []
-
-    for entry in feed.entries:
-
-        url = (
-            getattr(
-                entry,
-                "link",
-                None
-            )
-            or ""
-        )
-
-        post_id = extract_post_id(
-            url
-        )
-
-        if not post_id:
-            continue
-
-        title = (
-            getattr(
-                entry,
-                "title",
-                ""
-            )
-            or ""
-        )
-
-        published = (
-            getattr(
-                entry,
-                "published_parsed",
-                None
-            )
-        )
-
-        if published:
-
-            timestamp = time.mktime(
-                published
-            )
-
-        else:
-
-            timestamp = 0
-
-        posts.append(
-            {
-                "id": post_id,
-                "url": url,
-                "title": title,
-                "timestamp": timestamp,
-            }
-        )
-
-    # Oldest first
-    posts.sort(
-        key=lambda item: item["timestamp"]
-    )
-
-    return posts
-
-
-# ============================================================
-# SEND X VIDEO TO TELEGRAM
+# PROCESS X VIDEO
 # ============================================================
 
 async def process_x_post(
@@ -309,7 +378,14 @@ async def process_x_post(
     url = post["url"]
 
     print(
-        "New X post detected:",
+        "======================================"
+    )
+
+    print(
+        "🎬 VIDEO POST DETECTED"
+    )
+
+    print(
         url
     )
 
@@ -335,12 +411,10 @@ async def process_x_post(
                 video_path
             )
 
-            # Telegram standard Bot API limit
             if file_size > 50 * 1024 * 1024:
 
                 print(
-                    "Video is larger than 50 MB:",
-                    url
+                    "❌ Video is larger than 50 MB."
                 )
 
                 return False
@@ -351,7 +425,7 @@ async def process_x_post(
             )
 
             print(
-                "Uploading video to Telegram..."
+                "📤 Uploading to Telegram..."
             )
 
             with open(
@@ -367,41 +441,15 @@ async def process_x_post(
                 )
 
             print(
-                "✅ Successfully posted:",
-                post_id
+                f"✅ Successfully posted {post_id}"
             )
 
             return True
 
     except Exception as error:
 
-        error_text = str(error)
-
-        # A normal X post without a video
-        # should simply be skipped.
-        no_video_messages = [
-            "does not have a video",
-            "No video formats found",
-            "No video could be found",
-            "Unsupported URL",
-        ]
-
-        if any(
-            message.lower()
-            in error_text.lower()
-            for message in no_video_messages
-        ):
-
-            print(
-                "No downloadable video:",
-                url
-            )
-
-            return True
-
         print(
-            "ERROR processing:",
-            url
+            "❌ ERROR processing video:"
         )
 
         print(
@@ -424,7 +472,7 @@ async def monitor_x(
     )
 
     print(
-        "🤖 X MONITOR STARTED"
+        "🤖 OFFICIAL X API MONITOR STARTED"
     )
 
     print(
@@ -439,92 +487,179 @@ async def monitor_x(
         "======================================"
     )
 
-    processed_posts = load_processed_posts()
+    # Get the X account's numeric ID
+    try:
 
-    first_check = True
+        user_id = await get_x_user_id()
+
+    except Exception as error:
+
+        print(
+            "❌ Could not initialize X API:"
+        )
+
+        print(
+            error
+        )
+
+        return
+
+    state = load_state()
+
+    last_seen_id = state.get(
+        "last_seen_id"
+    )
+
+    # --------------------------------------------------------
+    # FIRST STARTUP
+    # --------------------------------------------------------
+
+    if not last_seen_id:
+
+        print(
+            "No previous X position found."
+        )
+
+        print(
+            "Getting latest posts..."
+        )
+
+        try:
+
+            posts = await get_x_posts(
+                user_id
+            )
+
+            if posts:
+
+                latest_id = max(
+                    post["id"]
+                    for post in posts
+                )
+
+                save_state(
+                    {
+                        "last_seen_id": latest_id
+                    }
+                )
+
+                print(
+                    f"✅ Initial position set:"
+                    f" {latest_id}"
+                )
+
+                print(
+                    "Old posts will NOT be downloaded."
+                )
+
+            else:
+
+                print(
+                    "No posts found."
+                )
+
+        except Exception as error:
+
+            print(
+                "❌ Initial X API check failed:"
+            )
+
+            print(
+                error
+            )
+
+        # Give X API a moment before monitoring
+        await asyncio.sleep(3)
+
+        last_seen_id = load_state().get(
+            "last_seen_id"
+        )
+
+    # --------------------------------------------------------
+    # CONTINUOUS MONITORING
+    # --------------------------------------------------------
 
     while True:
 
         try:
 
-            posts = await asyncio.to_thread(
-                get_x_posts
+            posts = await get_x_posts(
+                user_id,
+                since_id=last_seen_id
             )
 
-            if not posts:
+            if posts:
 
                 print(
-                    "No posts found in RSS feed."
+                    f"🆕 Found {len(posts)} new X post(s)."
                 )
 
-            else:
+                for post in posts:
 
-                # On first startup, don't download
-                # old posts. We only establish the
-                # current position.
-                if first_check:
+                    post_id = post["id"]
 
-                    for post in posts:
+                    # Move our position forward
+                    last_seen_id = post_id
 
-                        processed_posts.add(
-                            post["id"]
-                        )
-
-                    save_processed_posts(
-                        processed_posts
+                    save_state(
+                        {
+                            "last_seen_id": last_seen_id
+                        }
                     )
 
                     print(
-                        f"Initial position set. "
-                        f"Remembering {len(posts)} posts."
+                        "--------------------------------------"
                     )
 
-                    first_check = False
+                    print(
+                        "New X post:"
+                    )
 
-                else:
+                    print(
+                        post["url"]
+                    )
 
-                    for post in posts:
-
-                        post_id = post["id"]
-
-                        if post_id in processed_posts:
-                            continue
-
-                        print(
-                            "--------------------------------------"
-                        )
+                    if not post["has_video"]:
 
                         print(
-                            "🆕 NEW POST:",
-                            post["url"]
+                            "⏭️ No video. Skipping."
                         )
 
-                        success = await process_x_post(
-                            application,
-                            post
+                        continue
+
+                    success = await process_x_post(
+                        application,
+                        post
+                    )
+
+                    if not success:
+
+                        print(
+                            "⚠️ Video could not be uploaded."
                         )
 
-                        # Mark as processed whether:
-                        # - video was successfully uploaded
-                        # - post had no video
-                        #
-                        # If an unexpected download error
-                        # occurs, don't mark it yet.
-                        if success:
+            else:
 
-                            processed_posts.add(
-                                post_id
-                            )
-
-                            save_processed_posts(
-                                processed_posts
-                            )
+                print(
+                    "No new X posts."
+                )
 
         except Exception as error:
 
             print(
-                "MONITOR ERROR:",
+                "======================================"
+            )
+
+            print(
+                "❌ X MONITOR ERROR"
+            )
+
+            print(
                 error
+            )
+
+            print(
+                "======================================"
             )
 
         await asyncio.sleep(
@@ -546,7 +681,7 @@ async def start(
 
     await update.message.reply_text(
         "🤖 X Video Saver is online!\n\n"
-        "I can save X videos manually with:\n\n"
+        "Manual:\n"
         "/save X_POST_URL\n\n"
         f"👀 Automatic monitoring:\n"
         f"@{X_USERNAME}"
@@ -663,7 +798,9 @@ async def save_video(
             "MANUAL DOWNLOAD ERROR:"
         )
 
-        print(error)
+        print(
+            error
+        )
 
         try:
 
@@ -684,7 +821,6 @@ async def post_init(
     application
 ):
 
-    # Start automatic monitoring
     application.create_task(
         monitor_x(
             application
@@ -706,7 +842,6 @@ def main():
         .build()
     )
 
-    # Manual commands
     app.add_handler(
         CommandHandler(
             "start",
