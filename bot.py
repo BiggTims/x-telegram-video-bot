@@ -10,6 +10,7 @@ from telegram.ext import (
 )
 
 import yt_dlp
+import imageio_ffmpeg
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -19,26 +20,59 @@ CHANNEL = "@biggtimsxvid"
 def download_video(url: str, output_dir: str):
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
+    # Get the FFmpeg executable installed by imageio-ffmpeg
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+
     options = {
         "outtmpl": output_template,
+
+        # Best available video + audio, or best combined format
         "format": "bestvideo+bestaudio/best",
+
         "merge_output_format": "mp4",
+
+        # Tell yt-dlp exactly where FFmpeg is
+        "ffmpeg_location": ffmpeg_path,
+
         "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
+
+        "quiet": False,
+        "no_warnings": False,
+
+        # Current X/Twitter extractor
+        "extractor_args": {
+            "twitter": {
+                "api": ["graphql"]
+            }
+        },
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
+
         filename = ydl.prepare_filename(info)
 
-        # yt-dlp may merge the file into MP4
+        # If video/audio were merged into MP4
         mp4_file = os.path.splitext(filename)[0] + ".mp4"
 
         if os.path.exists(mp4_file):
             return mp4_file
 
-        return filename
+        # Otherwise return whatever yt-dlp produced
+        if os.path.exists(filename):
+            return filename
+
+        # Last-resort search for the downloaded video
+        for file in os.listdir(output_dir):
+            path = os.path.join(output_dir, file)
+
+            if os.path.isfile(path):
+                if file.lower().endswith(
+                    (".mp4", ".mkv", ".webm", ".mov")
+                ):
+                    return path
+
+        raise Exception("Downloaded video file could not be located.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -54,7 +88,7 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            "Send an X post URL after /save.\n\n"
+            "Send me an X post URL after /save.\n\n"
             "Example:\n"
             "/save https://x.com/user/status/123456789"
         )
@@ -69,11 +103,12 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status = await update.message.reply_text(
-        "⏳ Downloading the video..."
+        "⏳ Downloading the video from X..."
     )
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
+
             video_path = await asyncio.to_thread(
                 download_video,
                 url,
@@ -85,19 +120,21 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             file_size = os.path.getsize(video_path)
 
-            # Telegram Bot API standard upload limit
+            # Telegram standard Bot API upload limit
             if file_size > 50 * 1024 * 1024:
                 await status.edit_text(
-                    "❌ The video is larger than Telegram's "
-                    "standard 50 MB bot upload limit."
+                    "❌ This video is larger than Telegram's "
+                    "50 MB bot upload limit."
                 )
                 return
 
             await status.edit_text(
-                "📤 Uploading video to Telegram..."
+                "📤 Download complete!\n"
+                "Uploading to @biggtimsxvid..."
             )
 
             with open(video_path, "rb") as video:
+
                 await context.bot.send_video(
                     chat_id=CHANNEL,
                     video=video,
@@ -106,25 +143,35 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         await status.edit_text(
-            "✅ Video saved to @biggtimsxvid"
+            "✅ Video saved successfully to @biggtimsxvid!"
         )
 
     except Exception as error:
-        print("ERROR:", error)
+
+        print("====================================")
+        print("DOWNLOAD ERROR:")
+        print(error)
+        print("====================================")
 
         await status.edit_text(
-            "❌ I couldn't download that video.\n\n"
-            "We'll troubleshoot the X downloader next."
+            "❌ I couldn't download that X video.\n\n"
+            "Check the deployment logs for the exact error."
         )
 
 
 def main():
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("save", save_video))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
 
-    print("X Video Saver is running...")
+    app.add_handler(
+        CommandHandler("save", save_video)
+    )
+
+    print("🤖 X Video Saver is running...")
 
     app.run_polling()
 
