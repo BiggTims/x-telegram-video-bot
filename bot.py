@@ -133,7 +133,7 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Uploading to @biggtimsxvid..."
             )
 
-            with open(video_path, "rb") as video:
+                        with open(video_path, "rb") as video:
 
                 await context.bot.send_video(
                     chat_id=CHANNEL,
@@ -142,8 +142,13 @@ async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     supports_streaming=True,
                 )
 
-        await status.edit_text(
-            "✅ Video saved successfully to @biggtimsxvid!"
+            # The video has successfully reached the channel.
+            try:
+                await status.edit_text(
+                    "✅ Video saved successfully to @biggtimsxvid!"
+                )
+            except Exception as status_error:
+                print("STATUS UPDATE ERROR:", status_error)
         )
 
     except Exception as error:
