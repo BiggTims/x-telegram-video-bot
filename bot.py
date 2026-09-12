@@ -1,9 +1,12 @@
 import os
+import json
 import asyncio
 import tempfile
-import json
+from pathlib import Path
 
 import aiohttp
+import imageio_ffmpeg
+import yt_dlp
 
 from telegram import Update
 from telegram.ext import (
@@ -12,81 +15,62 @@ from telegram.ext import (
     ContextTypes,
 )
 
-import yt_dlp
-import imageio_ffmpeg
-
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
 
-X_BEARER_TOKEN = os.environ["X_BEARER_TOKEN"]
-
-CHANNEL = "@biggtimsxvid"
-
+TELEGRAM_CHANNEL = "@biggtimsxvid"
 X_USERNAME = "FERNANDEZFrdric"
 
-# Check X every 30 seconds
 CHECK_INTERVAL = 30
 
-# Remember the last X post seen
-STATE_FILE = "x_state.json"
+STATE_FILE = Path("x_state.json")
 
-X_API_BASE = "https://api.x.com/2"
+MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024
 
 
 # ============================================================
-# STATE
+# BASIC VALIDATION
+# ============================================================
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing.")
+
+if not X_BEARER_TOKEN:
+    raise RuntimeError("X_BEARER_TOKEN environment variable is missing.")
+
+
+# ============================================================
+# STATE MANAGEMENT
 # ============================================================
 
 def load_state():
-
-    if not os.path.exists(STATE_FILE):
+    if not STATE_FILE.exists():
         return {}
 
     try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
             return json.load(file)
-
     except Exception as error:
-
         print(
-            "Could not load state:",
-            error
+            f"Could not read state file: {error}",
+            flush=True
         )
-
         return {}
 
 
 def save_state(state):
-
     try:
-
-        with open(
-            STATE_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                state,
-                file,
-                indent=2
-            )
-
+        with open(STATE_FILE, "w", encoding="utf-8") as file:
+            json.dump(state, file)
     except Exception as error:
-
         print(
-            "Could not save state:",
-            error
+            f"Could not save state file: {error}",
+            flush=True
         )
 
 
@@ -94,83 +78,99 @@ def save_state(state):
 # X API REQUEST
 # ============================================================
 
-async def x_api_get(
-    session,
-    endpoint,
-    params=None
-):
-
-    url = f"{X_API_BASE}{endpoint}"
+async def x_api_get(endpoint, params=None):
+    url = f"https://api.x.com/2/{endpoint}"
 
     headers = {
-        "Authorization": f"Bearer {X_BEARER_TOKEN}"
+        "Authorization": f"Bearer {X_BEARER_TOKEN}",
+        "User-Agent": "X-Telegram-Video-Bot/1.0",
     }
 
-    async with session.get(
-        url,
-        headers=headers,
-        params=params,
-        timeout=aiohttp.ClientTimeout(total=30)
-    ) as response:
+    timeout = aiohttp.ClientTimeout(total=30)
 
-        text = await response.text()
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
 
-        if response.status != 200:
+        async with session.get(
+            url,
+            headers=headers,
+            params=params,
+        ) as response:
 
-            raise Exception(
-                f"X API error {response.status}: {text}"
+            text = await response.text()
+
+            print(
+                f"X API → {response.status} {endpoint}",
+                flush=True
             )
 
-        try:
+            if response.status != 200:
+                print(
+                    "X API ERROR RESPONSE:",
+                    flush=True
+                )
 
-            return json.loads(text)
+                print(
+                    text,
+                    flush=True
+                )
 
-        except Exception:
+                raise RuntimeError(
+                    f"X API returned HTTP {response.status}"
+                )
 
-            raise Exception(
-                f"Invalid X API response: {text}"
-            )
+            try:
+                return json.loads(text)
+
+            except json.JSONDecodeError:
+                raise RuntimeError(
+                    "X API returned invalid JSON."
+                )
 
 
 # ============================================================
-# GET X USER ID
+# FIND X USER ID
 # ============================================================
 
 async def get_x_user_id():
 
     print(
-        f"Looking up X user: @{X_USERNAME}"
+        f"Looking up X user: @{X_USERNAME}",
+        flush=True
     )
 
-    async with aiohttp.ClientSession() as session:
+    endpoint = (
+        f"users/by/username/{X_USERNAME}"
+    )
 
-        data = await x_api_get(
-            session,
-            f"/users/by/username/{X_USERNAME}",
-            {
-                "user.fields": "id,username"
-            }
-        )
+    params = {
+        "user.fields": "id,name,username",
+    }
+
+    data = await x_api_get(
+        endpoint,
+        params
+    )
 
     user = data.get("data")
 
     if not user:
-
-        raise Exception(
+        raise RuntimeError(
             f"Could not find X user @{X_USERNAME}"
         )
 
-    user_id = user["id"]
-
     print(
-        f"X user found: @{user['username']}"
+        f"X user found: @{user.get('username')}",
+        flush=True
     )
 
     print(
-        f"X user ID: {user_id}"
+        f"X user ID: {user.get('id')}",
+        flush=True
     )
 
-    return user_id
+    return user["id"]
 
 
 # ============================================================
@@ -184,33 +184,46 @@ async def get_x_posts(
 
     params = {
         "max_results": 10,
+
         "tweet.fields": (
-            "id,text,created_at,attachments"
+            "id,text,created_at,"
+            "attachments"
         ),
+
         "expansions": (
             "attachments.media_keys"
         ),
+
         "media.fields": (
-            "media_key,type"
-        )
+            "media_key,type,"
+            "url,preview_image_url,"
+            "duration_ms,width,height"
+        ),
+
+        # We only want original posts.
+        "exclude": "retweets,replies",
     }
 
     if since_id:
-
         params["since_id"] = since_id
 
-    async with aiohttp.ClientSession() as session:
-
-        data = await x_api_get(
-            session,
-            f"/users/{user_id}/tweets",
-            params
+        print(
+            f"Checking X posts newer than {since_id}",
+            flush=True
         )
 
-    posts = data.get(
-        "data",
-        []
+    else:
+        print(
+            "Getting latest X posts...",
+            flush=True
+        )
+
+    data = await x_api_get(
+        f"users/{user_id}/tweets",
+        params
     )
+
+    posts = data.get("data", [])
 
     includes = data.get(
         "includes",
@@ -223,7 +236,7 @@ async def get_x_posts(
     )
 
     media_by_key = {
-        media["media_key"]: media
+        media.get("media_key"): media
         for media in media_items
     }
 
@@ -231,55 +244,53 @@ async def get_x_posts(
 
     for post in posts:
 
-        media_keys = (
-            post.get("attachments", {})
-            .get("media_keys", [])
+        attachments = post.get(
+            "attachments",
+            {}
         )
 
-        has_video = False
+        media_keys = attachments.get(
+            "media_keys",
+            []
+        )
 
-        for media_key in media_keys:
+        post_media = [
+            media_by_key[key]
+            for key in media_keys
+            if key in media_by_key
+        ]
 
-            media = media_by_key.get(
-                media_key
-            )
+        has_video = any(
+            media.get("type") == "video"
+            for media in post_media
+        )
 
-            if not media:
-                continue
-
-            if media.get("type") == "video":
-
-                has_video = True
-
-                break
+        post_id = post["id"]
 
         results.append(
             {
-                "id": post["id"],
-
-                "url": (
-                    f"https://x.com/"
-                    f"{X_USERNAME}/status/"
-                    f"{post['id']}"
-                ),
-
+                "id": post_id,
                 "text": post.get(
                     "text",
                     ""
                 ),
-
                 "created_at": post.get(
                     "created_at"
                 ),
-
+                "url": (
+                    f"https://x.com/"
+                    f"{X_USERNAME}/status/"
+                    f"{post_id}"
+                ),
                 "has_video": has_video,
+                "media": post_media,
             }
         )
 
     # X normally returns newest first.
-    # Process oldest first.
+    # We process oldest first.
     results.sort(
-        key=lambda post: int(post["id"])
+        key=lambda item: int(item["id"])
     )
 
     return results
@@ -289,608 +300,110 @@ async def get_x_posts(
 # DOWNLOAD VIDEO FROM X
 # ============================================================
 
-def download_video(
-    url: str,
-    output_dir: str
-):
+async def download_video(post_url):
+
+    temp_dir = tempfile.mkdtemp(
+        prefix="xvideo_"
+    )
 
     output_template = os.path.join(
-        output_dir,
+        temp_dir,
         "%(id)s.%(ext)s"
     )
 
     ffmpeg_path = (
-        imageio_ffmpeg.get_ffmpeg_exe()
+        imageio_ffmpeg
+        .get_ffmpeg_exe()
     )
 
-    options = {
-
-        "outtmpl": output_template,
-
+    ydl_opts = {
         "format": (
             "bestvideo+bestaudio/"
             "best"
         ),
 
+        "outtmpl": output_template,
+
         "merge_output_format": "mp4",
 
         "ffmpeg_location": ffmpeg_path,
+
+        "quiet": True,
+
+        "no_warnings": True,
 
         "noplaylist": True,
 
         "extractor_args": {
             "twitter": {
-                "api": ["graphql"]
+                "api": [
+                    "graphql"
+                ]
             }
         },
-
-        "quiet": False,
-
-        "no_warnings": False,
     }
 
-    with yt_dlp.YoutubeDL(options) as ydl:
+    print(
+        f"Downloading video: {post_url}",
+        flush=True
+    )
 
-        info = ydl.extract_info(
-            url,
-            download=True
-        )
+    try:
 
-        filename = ydl.prepare_filename(
-            info
-        )
+        with yt_dlp.YoutubeDL(
+            ydl_opts
+        ) as ydl:
 
-        mp4_file = (
-            os.path.splitext(filename)[0]
-            + ".mp4"
-        )
-
-        if os.path.exists(
-            mp4_file
-        ):
-
-            return mp4_file
-
-        if os.path.exists(
-            filename
-        ):
-
-            return filename
-
-        for file in os.listdir(
-            output_dir
-        ):
-
-            path = os.path.join(
-                output_dir,
-                file
+            info = ydl.extract_info(
+                post_url,
+                download=True
             )
 
-            if os.path.isfile(path):
+            requested_downloads = (
+                info.get(
+                    "requested_downloads"
+                )
+                or []
+            )
 
-                if file.lower().endswith(
-                    (
-                        ".mp4",
-                        ".mkv",
-                        ".webm",
-                        ".mov"
-                    )
+            downloaded_file = None
+
+            for item in requested_downloads:
+
+                filepath = item.get(
+                    "filepath"
+                )
+
+                if filepath and os.path.exists(
+                    filepath
+                ):
+                    downloaded_file = filepath
+                    break
+
+            if not downloaded_file:
+
+                prepared = ydl.prepare_filename(
+                    info
+                )
+
+                possible_files = [
+                    prepared,
+                    os.path.splitext(
+                        prepared
+                    )[0] + ".mp4",
+                ]
+
+                for filepath in possible_files:
+
+                    if os.path.exists(filepath):
+                        downloaded_file = filepath
+                        break
+
+            if not downloaded_file:
+
+                for filename in os.listdir(
+                    temp_dir
                 ):
 
-                    return path
-
-        raise Exception(
-            "Downloaded video file could not be found."
-        )
-
-
-# ============================================================
-# PROCESS X VIDEO
-# ============================================================
-
-async def process_x_post(
-    application,
-    post
-):
-
-    post_id = post["id"]
-
-    url = post["url"]
-
-    print(
-        "======================================"
-    )
-
-    print(
-        "VIDEO POST DETECTED"
-    )
-
-    print(
-        url
-    )
-
-    try:
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-
-            video_path = await asyncio.to_thread(
-                download_video,
-                url,
-                temp_dir
-            )
-
-            if not os.path.exists(
-                video_path
-            ):
-
-                raise Exception(
-                    "Video file was not created."
-                )
-
-            file_size = os.path.getsize(
-                video_path
-            )
-
-            # Telegram Bot API standard limit
-            if file_size > 50 * 1024 * 1024:
-
-                print(
-                    "Video is larger than 50 MB."
-                )
-
-                return False
-
-            caption = (
-                f"📥 @{X_USERNAME}\n\n"
-                f"🔗 {url}"
-            )
-
-            print(
-                "Uploading video to Telegram..."
-            )
-
-            with open(
-                video_path,
-                "rb"
-            ) as video:
-
-                await application.bot.send_video(
-                    chat_id=CHANNEL,
-                    video=video,
-                    caption=caption,
-                    supports_streaming=True
-                )
-
-            print(
-                f"Successfully posted: {post_id}"
-            )
-
-            return True
-
-    except Exception as error:
-
-        print(
-            "ERROR processing video:"
-        )
-
-        print(
-            error
-        )
-
-        return False
-
-
-# ============================================================
-# AUTOMATIC X MONITOR
-# ============================================================
-
-async def monitor_x(
-    application
-):
-
-    print(
-        "======================================"
-    )
-
-    print(
-        "OFFICIAL X API MONITOR STARTED"
-    )
-
-    print(
-        f"Monitoring @{X_USERNAME}"
-    )
-
-    print(
-        f"Checking every {CHECK_INTERVAL} seconds"
-    )
-
-    print(
-        "======================================"
-    )
-
-    # --------------------------------------------------------
-    # GET USER ID
-    # --------------------------------------------------------
-
-    try:
-
-        user_id = await get_x_user_id()
-
-    except Exception as error:
-
-        print(
-            "X API INITIALIZATION ERROR:"
-        )
-
-        print(
-            error
-        )
-
-        return
-
-    state = load_state()
-
-    last_seen_id = state.get(
-        "last_seen_id"
-    )
-
-    # --------------------------------------------------------
-    # FIRST STARTUP
-    # --------------------------------------------------------
-
-    if not last_seen_id:
-
-        print(
-            "No previous X position found."
-        )
-
-        print(
-            "Getting latest posts..."
-        )
-
-        try:
-
-            posts = await get_x_posts(
-                user_id
-            )
-
-            if posts:
-
-                latest_id = max(
-                    post["id"]
-                    for post in posts
-                )
-
-                save_state(
-                    {
-                        "last_seen_id": latest_id
-                    }
-                )
-
-                print(
-                    f"Initial position set: {latest_id}"
-                )
-
-                print(
-                    "Old posts will NOT be downloaded."
-                )
-
-            else:
-
-                print(
-                    "No posts found."
-                )
-
-        except Exception as error:
-
-            print(
-                "INITIAL X API CHECK FAILED:"
-            )
-
-            print(
-                error
-            )
-
-        last_seen_id = load_state().get(
-            "last_seen_id"
-        )
-
-    # --------------------------------------------------------
-    # CONTINUOUS MONITORING
-    # --------------------------------------------------------
-
-    while True:
-
-        try:
-
-            posts = await get_x_posts(
-                user_id,
-                since_id=last_seen_id
-            )
-
-            if posts:
-
-                print(
-                    f"Found {len(posts)} new X post(s)."
-                )
-
-                for post in posts:
-
-                    post_id = post["id"]
-
-                    # Update position
-                    last_seen_id = post_id
-
-                    save_state(
-                        {
-                            "last_seen_id":
-                            last_seen_id
-                        }
-                    )
-
-                    print(
-                        "--------------------------------------"
-                    )
-
-                    print(
-                        "NEW X POST:"
-                    )
-
-                    print(
-                        post["url"]
-                    )
-
-                    if not post["has_video"]:
-
-                        print(
-                            "No video. Skipping."
-                        )
-
-                        continue
-
-                    success = await process_x_post(
-                        application,
-                        post
-                    )
-
-                    if not success:
-
-                        print(
-                            "Video could not be uploaded."
-                        )
-
-            else:
-
-                print(
-                    "No new X posts."
-                )
-
-        except Exception as error:
-
-            print(
-                "======================================"
-            )
-
-            print(
-                "X MONITOR ERROR:"
-            )
-
-            print(
-                error
-            )
-
-            print(
-                "======================================"
-            )
-
-        await asyncio.sleep(
-            CHECK_INTERVAL
-        )
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
-        return
-
-    await update.message.reply_text(
-        "🤖 X Video Saver is online!\n\n"
-        "Manual:\n"
-        "/save X_POST_URL\n\n"
-        f"👀 Automatic monitoring:\n"
-        f"@{X_USERNAME}"
-    )
-
-
-# ============================================================
-# /SAVE
-# ============================================================
-
-async def save_video(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Send me an X post URL after /save.\n\n"
-            "Example:\n"
-            "/save https://x.com/user/status/123456789"
-        )
-
-        return
-
-    url = context.args[0]
-
-    if (
-        "x.com/" not in url
-        and "twitter.com/" not in url
-    ):
-
-        await update.message.reply_text(
-            "❌ That doesn't look like an "
-            "X/Twitter post URL."
-        )
-
-        return
-
-    status = await update.message.reply_text(
-        "⏳ Downloading the video from X..."
-    )
-
-    try:
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-
-            video_path = await asyncio.to_thread(
-                download_video,
-                url,
-                temp_dir
-            )
-
-            if not os.path.exists(
-                video_path
-            ):
-
-                raise Exception(
-                    "Video file was not created."
-                )
-
-            file_size = os.path.getsize(
-                video_path
-            )
-
-            if file_size > 50 * 1024 * 1024:
-
-                await status.edit_text(
-                    "❌ This video is larger than "
-                    "Telegram's 50 MB bot upload limit."
-                )
-
-                return
-
-            await status.edit_text(
-                "📤 Video downloaded!\n"
-                "Uploading to @biggtimsxvid..."
-            )
-
-            with open(
-                video_path,
-                "rb"
-            ) as video:
-
-                await context.bot.send_video(
-                    chat_id=CHANNEL,
-                    video=video,
-                    caption=(
-                        f"📥 Saved from X\n"
-                        f"🔗 {url}"
-                    ),
-                    supports_streaming=True
-                )
-
-            try:
-
-                await status.edit_text(
-                    "✅ Video saved successfully "
-                    "to @biggtimsxvid!"
-                )
-
-            except Exception as status_error:
-
-                print(
-                    "STATUS UPDATE ERROR:",
-                    status_error
-                )
-
-    except Exception as error:
-
-        print(
-            "MANUAL DOWNLOAD ERROR:"
-        )
-
-        print(
-            error
-        )
-
-        try:
-
-            await status.edit_text(
-                "❌ I couldn't download that X video."
-            )
-
-        except Exception:
-
-            pass
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-async def post_init(
-    application
-):
-
-    # Start the monitor directly as an asyncio task.
-    # This avoids the PTB create_task startup warning.
-    asyncio.create_task(
-        monitor_x(
-            application
-        )
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    app = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "save",
-            save_video
-        )
-    )
-
-    print(
-        "X → Telegram Video Bot is running..."
-    )
-
-    app.run_polling()
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    main()
+                    filepath = os.path.join(
+                        temp_dir,
